@@ -142,6 +142,7 @@ class BaseMailbox(ABC):
     def get_current_ids(self, account: MailboxAccount) -> set:
         """返回当前邮件 ID 集合（用于过滤旧邮件）"""
         ...
+
     def _yyds_safe_extract(self, text: str, pattern: str = None) -> Optional[str]:
         """通用验证码提取逻辑：若有捕获组则返回 group(1)，否则返回 group(0)"""
         import re
@@ -185,15 +186,17 @@ class BaseMailbox(ABC):
         text = str(raw or "")
         if not text:
             return ""
-            
+
         # [修复点 4]：只有在明确包含常见邮件 Header 时，才进行 \r\n\r\n 切分。
         # 否则会误删 MaliAPI 等直接返回的已解析 JSON 正文内容（遇到普通的正文换行就错误截断了）
-        if re.search(r"(?im)^(?:Return-Path|Received|Date|From|To|Subject|Content-Type):", text):
+        if re.search(
+            r"(?im)^(?:Return-Path|Received|Date|From|To|Subject|Content-Type):", text
+        ):
             if "\r\n\r\n" in text:
                 text = text.split("\r\n\r\n", 1)[1]
             elif "\n\n" in text:
                 text = text.split("\n\n", 1)[1]
-                
+
         try:
             # 处理 Quoted-Printable
             decoded_bytes = quopri.decodestring(text)
@@ -208,6 +211,7 @@ class BaseMailbox(ABC):
         text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return text
+
 
 def create_mailbox(
     provider: str, extra: dict = None, proxy: str = None
@@ -291,6 +295,17 @@ def create_mailbox(
             project_code=extra.get("luckmail_project_code", ""),
             email_type=extra.get("luckmail_email_type", ""),
             domain=extra.get("luckmail_domain", ""),
+        )
+    elif provider == "yuemail_subdomain":
+        return YueMailSubdomainMailbox(
+            api_url=extra.get("yuemail_api_url", ""),
+            admin_token=extra.get("yuemail_admin_token", ""),
+            root_domain=extra.get("yuemail_root_domain", ""),
+            subdomain_prefix=extra.get("yuemail_subdomain_prefix", ""),
+            custom_auth=extra.get("yuemail_custom_auth", ""),
+            local_part_length=extra.get("yuemail_local_part_length", 10),
+            subdomain_length=extra.get("yuemail_subdomain_length", 12),
+            proxy=proxy,
         )
     else:  # laoudo
         return LaoudoMailbox(
@@ -403,6 +418,745 @@ class LaoudoMailbox(BaseMailbox):
             poll_interval=4,
             poll_once=poll_once,
         )
+
+
+class YueMailSubdomainMailbox(BaseMailbox):
+    def __init__(
+        self,
+        api_url: str,
+        admin_token: str = "",
+        root_domain: str = "",
+        subdomain_prefix: str = "",
+        custom_auth: str = "",
+        local_part_length: int = 10,
+        subdomain_length: int = 12,
+        proxy: str | None = None,
+    ):
+        self.api = api_url.rstrip("/")
+        self.admin_token = admin_token
+        self.root_domain = root_domain
+        self.subdomain_prefix = subdomain_prefix.strip().lower()
+        self.custom_auth = custom_auth
+        self.local_part_length = max(int(local_part_length or 10), 4)
+        self.subdomain_length = max(int(subdomain_length or 12), 4)
+        self.proxy = build_requests_proxy_config(proxy)
+
+        self._health_state: dict[str, dict[str, float | int]] = {}
+        self._health_lock = None
+        self._health_enabled = True
+        self._health_suspend_failures = 3
+        self._health_suspend_seconds = 600
+
+        self._email_cache: dict[str, dict[str, str | float]] = {}
+        self._last_used_mail_ids: dict[str, str] = {}
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "x-admin-auth": self.admin_token,
+        }
+        if self.custom_auth:
+            headers["x-custom-auth"] = self.custom_auth
+        return headers
+
+    def _normalize_domains(self, value: Any) -> list[str]:
+        if not value:
+            return []
+        text = str(value).strip().lower()
+        domains = []
+        for item in text.split(","):
+            domain = item.strip().lstrip("@")
+            if domain and domain not in domains:
+                domains.append(domain)
+        return domains
+
+    def _random_token(self, length: int) -> str:
+        import string
+
+        alphabet = string.ascii_lowercase + string.digits
+        return "".join(random.choices(alphabet, k=length))
+
+    def _pick_root_domain(self) -> str:
+        candidates = self._normalize_domains(self.root_domain)
+        if not candidates:
+            raise RuntimeError("YueMail 子域名服务缺少 root_domain 配置")
+        random.shuffle(candidates)
+        return self._rank_domains_by_health(candidates)[0]
+
+    def _rank_domains_by_health(self, domains: list[str]) -> list[str]:
+        if not self._health_enabled or len(domains) <= 1:
+            return domains
+
+        now = time.time()
+        all_suspended = all(
+            self._health_state.get(domain, {}).get("suspended_until", 0) > now
+            for domain in domains
+        )
+        if all_suspended:
+            return sorted(
+                domains,
+                key=lambda domain: self._health_state.get(domain, {}).get(
+                    "suspended_until", 0
+                ),
+            )
+
+        return sorted(
+            domains,
+            key=lambda domain: (
+                1
+                if self._health_state.get(domain, {}).get("suspended_until", 0) > now
+                else 0,
+                -self._health_state.get(domain, {}).get("score", 0),
+                self._health_state.get(domain, {}).get("consecutive_failures", 0),
+            ),
+        )
+
+    def _record_domain_success(self, domain: str) -> None:
+        if not domain or not self._health_enabled:
+            return
+        state = self._health_state.setdefault(
+            domain,
+            {
+                "score": 0.0,
+                "consecutive_failures": 0,
+                "suspended_until": 0.0,
+            },
+        )
+        state["score"] = min(state["score"] * 0.85 + 1.0, 8.0)
+        state["consecutive_failures"] = 0
+        state["suspended_until"] = 0.0
+
+    def _record_domain_failure(self, domain: str) -> None:
+        if not domain or not self._health_enabled:
+            return
+        state = self._health_state.setdefault(
+            domain,
+            {
+                "score": 0.0,
+                "consecutive_failures": 0,
+                "suspended_until": 0.0,
+            },
+        )
+        state["score"] = max(state["score"] * 0.85 - 1.5, -8.0)
+        state["consecutive_failures"] += 1
+        if state["consecutive_failures"] >= self._health_suspend_failures:
+            state["suspended_until"] = time.time() + self._health_suspend_seconds
+
+    def _extract_root_domain(self, email: str) -> str:
+        address_domain = str(email or "").strip().lower().split("@")[-1]
+        candidates = self._normalize_domains(self.root_domain)
+        for candidate in candidates:
+            if address_domain == candidate or address_domain.endswith(f".{candidate}"):
+                return candidate
+        return ""
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[dict] = None,
+        json_body: Optional[dict] = None,
+        timeout: int = 15,
+    ) -> Any:
+        import requests
+
+        response = requests.request(
+            method,
+            f"{self.api}{path}",
+            params=params,
+            json=json_body,
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"YueMail API {path} 失败: HTTP {response.status_code}")
+        try:
+            return response.json()
+        except Exception:
+            return {"raw_response": response.text}
+
+    def _decode_mime_header(self, value: str) -> str:
+        from email.header import decode_header, make_header
+
+        if not value:
+            return ""
+        try:
+            return str(make_header(decode_header(value)))
+        except Exception:
+            return value
+
+    def _extract_body_from_message(self, message) -> str:
+        import re
+        from html import unescape
+
+        parts: list[str] = []
+
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_maintype() == "multipart":
+                    continue
+                content_type = (part.get_content_type() or "").lower()
+                if content_type not in ("text/plain", "text/html"):
+                    continue
+                try:
+                    payload = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or "utf-8"
+                    if isinstance(payload, bytes):
+                        text = payload.decode(charset, errors="replace")
+                    elif isinstance(payload, str):
+                        text = payload
+                    else:
+                        text = ""
+                except Exception:
+                    try:
+                        text = str(part.get_payload() or "")
+                    except Exception:
+                        text = ""
+                if content_type == "text/html":
+                    text = re.sub(r"<[^>]+>", " ", text)
+                parts.append(text)
+        else:
+            try:
+                payload = message.get_payload(decode=True)
+                charset = message.get_content_charset() or "utf-8"
+                if isinstance(payload, bytes):
+                    body = payload.decode(charset, errors="replace")
+                elif isinstance(payload, str):
+                    body = payload
+                else:
+                    body = ""
+            except Exception:
+                try:
+                    body = str(message.get_payload() or "")
+                except Exception:
+                    body = ""
+            if "html" in (message.get_content_type() or "").lower():
+                body = re.sub(r"<[^>]+>", " ", body)
+            parts.append(body)
+
+        return unescape("\n".join(part for part in parts if part).strip())
+
+    def _extract_mails_from_response(self, response: Any) -> list[dict[str, Any]]:
+        if isinstance(response, list):
+            return [mail for mail in response if isinstance(mail, dict)]
+        if not isinstance(response, dict):
+            return []
+        for key in ("results", "mails", "data", "items", "list"):
+            value = response.get(key)
+            if isinstance(value, list):
+                return [mail for mail in value if isinstance(mail, dict)]
+        return []
+
+    def _extract_mail_detail_from_response(
+        self, response: Any
+    ) -> Optional[dict[str, Any]]:
+        if not isinstance(response, dict):
+            return None
+        if response.get("raw"):
+            return response
+        for key in ("mail", "data", "result", "item"):
+            value = response.get(key)
+            if isinstance(value, dict):
+                return value
+        if response.get("subject") or response.get("text") or response.get("body"):
+            return response
+        return None
+
+    def _extract_mail_fields(self, mail: dict[str, Any]) -> dict[str, str]:
+        import re
+        from email import message_from_string
+        from email.policy import default as email_policy
+        from html import unescape
+
+        sender = str(
+            mail.get("source")
+            or mail.get("from")
+            or mail.get("from_address")
+            or mail.get("fromAddress")
+            or ""
+        ).strip()
+        subject = str(mail.get("subject") or mail.get("title") or "").strip()
+        body_text = str(
+            mail.get("text")
+            or mail.get("body")
+            or mail.get("content")
+            or mail.get("html")
+            or ""
+        ).strip()
+        raw = str(mail.get("raw") or "").strip()
+
+        if raw:
+            try:
+                message = message_from_string(raw, policy=email_policy)
+                sender = sender or self._decode_mime_header(message.get("From", ""))
+                subject = subject or self._decode_mime_header(
+                    message.get("Subject", "")
+                )
+                parsed_body = self._extract_body_from_message(message)
+                if parsed_body:
+                    body_text = (
+                        f"{body_text}\n{parsed_body}".strip()
+                        if body_text
+                        else parsed_body
+                    )
+            except Exception:
+                body_text = f"{body_text}\n{raw}".strip() if body_text else raw
+
+        body_text = unescape(re.sub(r"<[^>]+>", " ", body_text))
+        return {
+            "sender": sender,
+            "subject": subject,
+            "body": body_text,
+            "raw": raw,
+        }
+
+    def _mail_appears_for_email(self, mail: dict[str, Any], email: str) -> bool:
+        target = str(email or "").strip().lower()
+        if not target:
+            return False
+        for value in (
+            mail.get("address"),
+            mail.get("email"),
+            mail.get("to"),
+            mail.get("to_address"),
+            mail.get("toAddress"),
+            mail.get("target"),
+            mail.get("recipient"),
+        ):
+            text = str(value or "").strip().lower()
+            if text and target in text:
+                return True
+        parsed = self._extract_mail_fields(mail)
+        text_blob = "\n".join(
+            [
+                str(parsed.get("sender") or ""),
+                str(parsed.get("subject") or ""),
+                str(parsed.get("body") or ""),
+                str(parsed.get("raw") or ""),
+            ]
+        ).lower()
+        return target in text_blob
+
+    def _parse_mail_timestamp(self, value: Any) -> Optional[float]:
+        from datetime import datetime, timezone
+
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 10**12:
+                timestamp /= 1000.0
+            return timestamp if timestamp > 0 else None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            timestamp = float(text)
+            if timestamp > 10**12:
+                timestamp /= 1000.0
+            return timestamp if timestamp > 0 else None
+        except ValueError:
+            pass
+        iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            parsed = datetime.fromisoformat(iso_text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return (
+                    datetime.strptime(text, fmt)
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                )
+            except ValueError:
+                continue
+        return None
+
+    def _extract_mail_timestamp(self, mail: dict[str, Any]) -> Optional[float]:
+        from datetime import timezone
+        from email import message_from_string
+        from email.policy import default as email_policy
+        from email.utils import parsedate_to_datetime
+
+        for key in (
+            "createdAt",
+            "created_at",
+            "date",
+            "created",
+            "timestamp",
+            "time",
+            "receivedAt",
+            "received_at",
+        ):
+            timestamp = self._parse_mail_timestamp(mail.get(key))
+            if timestamp is not None:
+                return timestamp
+        raw = str(mail.get("raw") or "").strip()
+        if raw:
+            try:
+                message = message_from_string(raw, policy=email_policy)
+                date_header = str(message.get("Date") or "").strip()
+                if date_header:
+                    parsed = parsedate_to_datetime(date_header)
+                    if parsed is not None:
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        return parsed.timestamp()
+            except Exception:
+                return None
+        return None
+
+    def _extract_mail_id(self, mail: dict[str, Any]) -> str:
+        for key in ("id", "mail_id", "mailId", "_id", "uuid"):
+            value = mail.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        fallback = "|".join(
+            str(mail.get(key) or "").strip()
+            for key in (
+                "createdAt",
+                "created_at",
+                "date",
+                "source",
+                "from",
+                "subject",
+                "title",
+            )
+        )
+        return fallback or str(
+            hash(json.dumps(mail, sort_keys=True, ensure_ascii=False))
+        )
+
+    def _is_openai_otp_mail(
+        self, sender: str, subject: str, body: str, raw: str
+    ) -> bool:
+        sender_l = str(sender or "").lower()
+        subject_l = str(subject or "").lower()
+        body_l = str(body or "").lower()
+        raw_l = str(raw or "").lower()
+        blob = f"{sender_l}\n{subject_l}\n{body_l}\n{raw_l}"
+        if "openai" not in sender_l and "openai" not in blob:
+            return False
+        otp_keywords = (
+            "verification",
+            "verification code",
+            "verify",
+            "one-time code",
+            "one time code",
+            "otp",
+            "security code",
+            "验证码",
+        )
+        return any(keyword in blob for keyword in otp_keywords)
+
+    def _extract_otp_code(
+        self, subject: str, content: str, pattern: Optional[str]
+    ) -> tuple[Optional[str], bool]:
+        import re
+
+        subject_text = str(subject or "")
+        content_text = str(content or "")
+        subject_code = self._safe_extract(subject_text, pattern)
+        if subject_code:
+            return subject_code, True
+        if not content_text:
+            return None, False
+        semantic_match = re.search(
+            r"(?is)(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code|验证码|校验码|动态码|認證碼|驗證碼)[^0-9]{0,30}(\d{6})",
+            content_text,
+        )
+        if semantic_match:
+            return semantic_match.group(1), True
+        fallback_keywords = (
+            "verification",
+            "verify",
+            "code",
+            "otp",
+            "security",
+            "验证码",
+            "one-time",
+            "one time",
+        )
+        fallback_pattern = pattern or r"(?<![a-zA-Z0-9])(\d{6})(?![a-zA-Z0-9])"
+        for simple_match in re.finditer(fallback_pattern, content_text):
+            code = (
+                simple_match.group(1)
+                if simple_match.groups()
+                else simple_match.group(0)
+            )
+            start = max(simple_match.start() - 48, 0)
+            end = min(simple_match.end() + 48, len(content_text))
+            window = content_text[start:end].lower()
+            if any(keyword in window for keyword in fallback_keywords):
+                return code, False
+        fallback_code = self._safe_extract(content_text, pattern)
+        return fallback_code, False
+
+    def get_email(self) -> MailboxAccount:
+        root_domain = self._pick_root_domain()
+        local_part = self._random_token(self.local_part_length)
+        subdomain = (
+            self.subdomain_prefix + self._random_token(self.subdomain_length)
+            if self.subdomain_prefix
+            else self._random_token(self.subdomain_length)
+        )
+        email = f"{local_part}@{subdomain}.{root_domain}".lower()
+
+        self._email_cache[email] = {
+            "email": email,
+            "root_domain": root_domain,
+            "subdomain": subdomain,
+            "created_at": time.time(),
+        }
+
+        self._log(f"[YueMail] 生成子域名邮箱: {email}")
+        return MailboxAccount(
+            email=email,
+            account_id=email,
+            extra={"root_domain": root_domain, "subdomain": subdomain},
+        )
+
+    def _fetch_mails(self, email: str, email_id: Optional[str] = None) -> list:
+        attempts = [
+            {
+                "path": "/admin/mails",
+                "params": {"limit": 80, "offset": 0, "address": email},
+            }
+        ]
+        if email_id and email_id != email:
+            attempts.append(
+                {
+                    "path": "/admin/mails",
+                    "params": {"limit": 80, "offset": 0, "address": email_id},
+                }
+            )
+        attempts.append({"path": "/admin/mails", "params": {"limit": 120, "offset": 0}})
+
+        for attempt in attempts:
+            try:
+                data = self._request_json(
+                    "GET",
+                    attempt["path"],
+                    params=attempt["params"],
+                    timeout=10,
+                )
+                mails = self._extract_mails_from_response(data)
+                if not mails:
+                    continue
+                if "address" not in attempt["params"]:
+                    mails = [
+                        mail
+                        for mail in mails
+                        if self._mail_appears_for_email(mail, email)
+                    ]
+                if mails:
+                    return mails
+            except Exception:
+                continue
+
+        return []
+
+    def _fetch_mail_detail(self, mail_id: str) -> dict:
+        try:
+            data = self._request_json("GET", f"/admin/mails/{mail_id}", timeout=10)
+            detail = self._extract_mail_detail_from_response(data)
+            return detail or {}
+        except Exception:
+            return {}
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        try:
+            mails = self._fetch_mails(account.email, account.account_id or None)
+            return {
+                self._extract_mail_id(mail)
+                for mail in mails
+                if self._extract_mail_id(mail)
+            }
+        except Exception:
+            return set()
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        root_domain = self._extract_root_domain(account.email)
+        seen = {
+            str(item).strip() for item in (before_ids or set()) if str(item).strip()
+        }
+        otp_sent_at = kwargs.get("otp_sent_at")
+        exclude_codes = {
+            str(code).strip()
+            for code in (kwargs.get("exclude_codes") or set())
+            if str(code).strip()
+        }
+        last_used_mail_id = self._last_used_mail_ids.get(account.email)
+        unknown_ts_grace_seconds = 15
+        started_at = time.time()
+
+        def merge_fields(
+            primary: dict[str, str], secondary: dict[str, str]
+        ) -> dict[str, str]:
+            return {
+                "sender": secondary.get("sender") or primary.get("sender") or "",
+                "subject": secondary.get("subject") or primary.get("subject") or "",
+                "body": "\n".join(
+                    part
+                    for part in [primary.get("body") or "", secondary.get("body") or ""]
+                    if part
+                ).strip(),
+                "raw": secondary.get("raw") or primary.get("raw") or "",
+            }
+
+        def poll_once() -> Optional[str]:
+            try:
+                mails = self._fetch_mails(account.email, account.account_id or None)
+                mails = sorted(
+                    mails,
+                    key=lambda mail: self._extract_mail_timestamp(mail) or 0.0,
+                    reverse=True,
+                )
+                candidates: list[dict[str, Any]] = []
+                unknown_ts_candidates: list[dict[str, Any]] = []
+                for mail in mails:
+                    mail_id = self._extract_mail_id(mail)
+                    if (
+                        not mail_id
+                        or mail_id in seen
+                        or (last_used_mail_id and mail_id == last_used_mail_id)
+                    ):
+                        continue
+                    mail_ts = self._extract_mail_timestamp(mail)
+                    if (
+                        otp_sent_at
+                        and mail_ts is not None
+                        and mail_ts + 2 < float(otp_sent_at)
+                    ):
+                        seen.add(mail_id)
+                        continue
+
+                    parsed = self._extract_mail_fields(mail)
+                    detail = {}
+                    if (
+                        not self._is_openai_otp_mail(
+                            parsed["sender"],
+                            parsed["subject"],
+                            parsed["body"],
+                            parsed["raw"],
+                        )
+                        or not parsed["body"]
+                    ):
+                        detail = self._fetch_mail_detail(mail_id)
+                        if detail:
+                            detail_parsed = self._extract_mail_fields(detail)
+                            parsed = merge_fields(parsed, detail_parsed)
+                            detail_ts = self._extract_mail_timestamp(detail)
+                            if detail_ts is not None:
+                                mail_ts = detail_ts
+
+                    if (
+                        otp_sent_at
+                        and mail_ts is not None
+                        and mail_ts + 2 < float(otp_sent_at)
+                    ):
+                        seen.add(mail_id)
+                        continue
+
+                    if not self._is_openai_otp_mail(
+                        parsed["sender"],
+                        parsed["subject"],
+                        parsed["body"],
+                        parsed["raw"],
+                    ):
+                        if detail:
+                            seen.add(mail_id)
+                        continue
+
+                    content = "\n".join(
+                        part
+                        for part in [
+                            parsed["sender"],
+                            parsed["subject"],
+                            parsed["body"],
+                            parsed["raw"],
+                        ]
+                        if part
+                    )
+                    code, semantic_hit = self._extract_otp_code(
+                        parsed["subject"], content, code_pattern
+                    )
+                    if not code or code in exclude_codes:
+                        if detail:
+                            seen.add(mail_id)
+                        continue
+
+                    candidate = {
+                        "mail_id": mail_id,
+                        "code": code,
+                        "mail_ts": mail_ts,
+                        "semantic_hit": bool(semantic_hit),
+                        "is_recent": bool(
+                            otp_sent_at
+                            and (mail_ts is not None)
+                            and (mail_ts + 2 >= float(otp_sent_at))
+                        ),
+                    }
+                    if otp_sent_at and mail_ts is None:
+                        unknown_ts_candidates.append(candidate)
+                    else:
+                        candidates.append(candidate)
+                    seen.add(mail_id)
+
+                elapsed = time.time() - started_at
+                if (
+                    otp_sent_at
+                    and (not candidates)
+                    and unknown_ts_candidates
+                    and elapsed < unknown_ts_grace_seconds
+                ):
+                    return None
+
+                all_candidates = candidates + unknown_ts_candidates
+                if all_candidates:
+                    best = sorted(
+                        all_candidates,
+                        key=lambda item: (
+                            1 if item.get("is_recent") else 0,
+                            1 if item.get("semantic_hit") else 0,
+                            1 if item.get("mail_ts") is not None else 0,
+                            float(item.get("mail_ts") or 0.0),
+                        ),
+                        reverse=True,
+                    )[0]
+                    code = str(best["code"])
+                    self._last_used_mail_ids[account.email] = str(best["mail_id"])
+                    self._record_domain_success(root_domain)
+                    self._log(f"[YueMail] 收到验证码: {code}")
+                    return code
+            except Exception:
+                pass
+            return None
+
+        try:
+            return self._run_polling_wait(
+                timeout=timeout,
+                poll_interval=3,
+                poll_once=poll_once,
+            )
+        except TimeoutError:
+            self._record_domain_failure(root_domain)
+            raise
 
 
 class AitreMailbox(BaseMailbox):
@@ -1094,7 +1848,9 @@ class MaliAPIMailbox(BaseMailbox):
                             str(message.get("snippet") or ""),
                         ]
                     ).strip()
-                    search_text = self._yyds_decode_raw_content(search_text) or search_text
+                    search_text = (
+                        self._yyds_decode_raw_content(search_text) or search_text
+                    )
                     search_text = re.sub(
                         r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
                         "",
@@ -1185,7 +1941,9 @@ class GPTMailMailbox(BaseMailbox):
 
         if response.status_code >= 400:
             error = payload.get("error") if isinstance(payload, dict) else ""
-            message = str(error or response.text or f"HTTP {response.status_code}").strip()
+            message = str(
+                error or response.text or f"HTTP {response.status_code}"
+            ).strip()
             raise RuntimeError(f"GPTMail API {path} 失败: {message}")
 
         if isinstance(payload, dict) and payload.get("success") is False:
@@ -1197,7 +1955,9 @@ class GPTMailMailbox(BaseMailbox):
         return payload
 
     def _list_messages(self, email: str) -> list[dict]:
-        data = self._request_json("GET", "/api/emails", params={"email": email}, timeout=10)
+        data = self._request_json(
+            "GET", "/api/emails", params={"email": email}, timeout=10
+        )
         if isinstance(data, dict):
             messages = data.get("emails", [])
         else:
@@ -1216,7 +1976,11 @@ class GPTMailMailbox(BaseMailbox):
             return MailboxAccount(
                 email=email,
                 account_id=email,
-                extra={"provider": "gptmail", "domain": self.domain, "local_address": True},
+                extra={
+                    "provider": "gptmail",
+                    "domain": self.domain,
+                    "local_address": True,
+                },
             )
 
         data = self._request_json("GET", "/api/generate-email")
@@ -2276,7 +3040,10 @@ class LuckMailMailbox(BaseMailbox):
                         raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
 
                     last_status = str(code_result.status or "pending")
-                    if code_result.status == "success" and code_result.verification_code:
+                    if (
+                        code_result.status == "success"
+                        and code_result.verification_code
+                    ):
                         code = code_result.verification_code
                         self._log(f"[LuckMail] 收到验证码: {code}")
                         return code
