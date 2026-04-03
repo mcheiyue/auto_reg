@@ -79,11 +79,18 @@ CONFIG_KEYS = [
     "grok2api_quota",
     "kiro_manager_path",
     "kiro_manager_exe",
+    "yuemail_api_url",
+    "yuemail_admin_token",
+    "yuemail_root_domain",
+    "yuemail_subdomain_prefix",
+    "yuemail_custom_auth",
+    "yuemail_local_part_length",
+    "yuemail_subdomain_length",
 ]
 
 
 class ConfigUpdate(BaseModel):
-    data: dict
+    data: dict[str, object]
 
 
 @router.get("")
