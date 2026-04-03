@@ -75,6 +75,11 @@ export default function RegisterTaskPage() {
         cfworker_subdomain: cfg.cfworker_subdomain || '',
         cfworker_random_subdomain: parseBooleanConfigValue(cfg.cfworker_random_subdomain),
         cfworker_fingerprint: cfg.cfworker_fingerprint || '',
+        yuemail_api_url: cfg.yuemail_api_url || '',
+        yuemail_admin_token: cfg.yuemail_admin_token || '',
+        yuemail_root_domain: cfg.yuemail_root_domain || '',
+        yuemail_subdomain_prefix: cfg.yuemail_subdomain_prefix || '',
+        yuemail_custom_auth: cfg.yuemail_custom_auth || '',
         smstome_cookie: cfg.smstome_cookie || '',
         smstome_country_slugs: cfg.smstome_country_slugs || '',
         smstome_phone_attempts: cfg.smstome_phone_attempts || '',
@@ -125,6 +130,11 @@ export default function RegisterTaskPage() {
       cfworker_subdomain: values.cfworker_subdomain,
       cfworker_random_subdomain: values.cfworker_random_subdomain,
       cfworker_fingerprint: values.cfworker_fingerprint,
+      yuemail_api_url: values.yuemail_api_url,
+      yuemail_admin_token: values.yuemail_admin_token,
+      yuemail_root_domain: values.yuemail_root_domain,
+      yuemail_subdomain_prefix: values.yuemail_subdomain_prefix,
+      yuemail_custom_auth: values.yuemail_custom_auth,
       smstome_cookie: values.smstome_cookie,
       smstome_country_slugs: values.smstome_country_slugs,
       smstome_phone_attempts: values.smstome_phone_attempts,
@@ -175,7 +185,9 @@ export default function RegisterTaskPage() {
         clearInterval(interval)
         setPolling(false)
         if (t.cashier_urls && t.cashier_urls.length > 0) {
-          t.cashier_urls.forEach((url: string) => window.open(url, '_blank'))
+          t.cashier_urls.forEach((url: string) => {
+            window.open(url, '_blank')
+          })
         }
       }
     }, 2000)
@@ -281,6 +293,7 @@ export default function RegisterTaskPage() {
                 { value: 'freemail', label: 'Freemail' },
                 { value: 'laoudo', label: 'Laoudo' },
                 { value: 'cfworker', label: 'CF Worker' },
+                { value: 'yuemail_subdomain', label: 'YueMail 子域名邮箱' },
               ]}
             />
           </Form.Item>
@@ -403,6 +416,25 @@ export default function RegisterTaskPage() {
               </Form.Item>
             </>
           )}
+          {mailProvider === 'yuemail_subdomain' && (
+            <>
+              <Form.Item name="yuemail_api_url" label="API URL">
+                <Input placeholder="https://your-worker-url.com" />
+              </Form.Item>
+              <Form.Item name="yuemail_admin_token" label="Admin Token">
+                <Input.Password placeholder="your-admin-token" />
+              </Form.Item>
+              <Form.Item name="yuemail_root_domain" label="根域名">
+                <Input placeholder="example.com（多个用逗号分隔）" />
+              </Form.Item>
+              <Form.Item name="yuemail_subdomain_prefix" label="子域名前缀（可选）">
+                <Input placeholder="mail" />
+              </Form.Item>
+              <Form.Item name="yuemail_custom_auth" label="自定义认证头（可选）">
+                <Input.Password placeholder="留空表示未启用" />
+              </Form.Item>
+            </>
+          )}
           {mailProvider === 'luckmail' && (
             <>
               <Form.Item name="luckmail_base_url" label="平台地址">
@@ -498,8 +530,8 @@ export default function RegisterTaskPage() {
           )}
           {task.errors?.length > 0 && (
             <div style={{ marginTop: 8 }}>
-              {task.errors.map((e: string, i: number) => (
-                <div key={i} style={{ color: '#ef4444', marginBottom: 4 }}>
+              {task.errors.map((e: string) => (
+                <div key={`${task.id ?? 'task'}-${e}`} style={{ color: '#ef4444', marginBottom: 4 }}>
                   <CloseCircleOutlined /> {e}
                 </div>
               ))}

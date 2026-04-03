@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch } from 'antd'
 import {
   SaveOutlined,
@@ -29,6 +29,7 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'OpenTrashMail', value: 'opentrashmail' },
     { label: 'Freemail（自建 CF Worker）', value: 'freemail' },
     { label: 'CF Worker（自建域名）', value: 'cfworker' },
+    { label: 'YueMail 子域名邮箱', value: 'yuemail_subdomain' },
   ],
   maliapi_auto_domain_strategy: [
     { label: 'balanced', value: 'balanced' },
@@ -178,6 +179,17 @@ const TAB_ITEMS = [
           { key: 'luckmail_api_key', label: 'API Key', secret: true },
           { key: 'luckmail_email_type', label: '邮箱类型（可选）', placeholder: 'ms_graph / ms_imap / self_built' },
           { key: 'luckmail_domain', label: '邮箱域名（可选）', placeholder: 'outlook.com / gmail.com' },
+        ],
+      },
+      {
+        title: 'YueMail 子域名邮箱',
+        desc: '动态生成子域名邮箱，内置健康评分机制',
+        fields: [
+          { key: 'yuemail_api_url', label: 'API URL', placeholder: 'https://your-worker-url.com' },
+          { key: 'yuemail_admin_token', label: 'Admin Token', secret: true },
+          { key: 'yuemail_root_domain', label: '根域名', placeholder: 'example.com（多个用逗号分隔）' },
+          { key: 'yuemail_subdomain_prefix', label: '子域名前缀（可选）', placeholder: 'mail' },
+          { key: 'yuemail_custom_auth', label: '自定义认证头（可选）', secret: true },
         ],
       },
     ],
@@ -571,14 +583,14 @@ function CFWorkerDomainPoolSection({ form }: { form: any }) {
 function SolverStatus() {
   const [running, setRunning] = useState<boolean | null>(null)
 
-  const checkSolver = async () => {
+  const checkSolver = useCallback(async () => {
     try {
       const d = await apiFetch('/solver/status')
       setRunning(d.running)
     } catch {
       setRunning(false)
     }
-  }
+  }, [])
 
   const restartSolver = async () => {
     await apiFetch('/solver/restart', { method: 'POST' })
@@ -590,7 +602,7 @@ function SolverStatus() {
     checkSolver()
     const timer = window.setInterval(checkSolver, 5000)
     return () => window.clearInterval(timer)
-  }, [])
+  }, [checkSolver])
 
   return (
     <Card title="Turnstile Solver" size="small" style={{ marginBottom: 16 }}>
@@ -643,7 +655,7 @@ function IntegrationsPanel() {
     })
   }
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true)
     try {
       const d = await apiFetch('/integrations/services')
@@ -651,13 +663,13 @@ function IntegrationsPanel() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     load()
     const timer = window.setInterval(load, 5000)
     return () => window.clearInterval(timer)
-  }, [])
+  }, [load])
 
   const doAction = async (key: string, request: Promise<any>) => {
     setBusy(key)
@@ -822,14 +834,14 @@ function SecurityPanel() {
   const [totpSecret, setTotpSecret] = useState('')
   const [totpUri, setTotpUri] = useState('')
 
-  const loadStatus = async () => {
+  const loadStatus = useCallback(async () => {
     try {
       const s = await apiFetch('/auth/status')
       setStatus(s)
     } catch {}
-  }
+  }, [])
 
-  useEffect(() => { loadStatus() }, [])
+  useEffect(() => { loadStatus() }, [loadStatus])
 
   const handleEnable = async (values: { password: string; confirm: string }) => {
     if (values.password !== values.confirm) {
