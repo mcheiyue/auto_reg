@@ -589,6 +589,9 @@ class RefreshTokenRegistrationEngine:
         post_page_type = getattr(self, "_post_otp_page_type", "") or ""
         if post_page_type.lower() == "add_phone":
             self._log("OpenAI 要求绑定手机号，尝试重新验证以绕过...", "warning")
+
+            # 更新时间戳，让邮箱服务从当前时间之后查找新验证码
+            self._otp_sent_at = time.time()
             
             # 直接重新发送验证码并验证，看是否能绕过 add-phone 页面
             self._log("重新发送验证码...")
@@ -604,7 +607,11 @@ class RefreshTokenRegistrationEngine:
                     timeout=15,
                 )
                 self._log(f"重新发送验证码状态: {send_resp.status_code}")
-                time.sleep(random.uniform(2.0, 4.0))
+                
+                # 等待邮件到达
+                wait_time = random.uniform(3.0, 6.0)
+                self._log(f"等待新邮件到达: {wait_time:.1f}秒...")
+                time.sleep(wait_time)
             except Exception as e:
                 self._log(f"重新发送验证码异常: {e}")
 
@@ -843,6 +850,12 @@ class RefreshTokenRegistrationEngine:
             )
 
             self._log(f"验证码发送状态: {response.status_code}")
+            
+            # 等待邮件到达（邮件服务器需要时间）
+            wait_time = random.uniform(3.0, 6.0)
+            self._log(f"等待邮件到达: {wait_time:.1f}秒...")
+            time.sleep(wait_time)
+            
             return response.status_code == 200
 
         except Exception as e:
